@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
 import 'package:intl/intl.dart';
+import 'package:csv/csv.dart'; // Ensure csv: ^6.0.0 is in pubspec.yaml
 import 'attendance_model.dart';
 
 class DataProvider extends ChangeNotifier {
@@ -10,62 +11,54 @@ class DataProvider extends ChangeNotifier {
 
   bool get isLoading => _isLoading;
 
-  // --- 1. GET ALL LOGS ---
-  List<AttendanceLog> get allLogs {
-    if (_box == null) return [];
-    var list = _box!.values.toList();
-    list.sort((a, b) {
-      int dateComp = b.logDate.compareTo(a.logDate);
-      if (dateComp != 0) return dateComp;
-      return a.entryTime.compareTo(b.entryTime);
-    });
-    return list;
-  }
-
-  // --- 2. GET LOGS FOR DATE ---
-  List<AttendanceLog> getLogsForDate(DateTime date) {
-    if (_box == null) return [];
-    return _box!.values.where((l) =>
-    l.logDate.year == date.year &&
-        l.logDate.month == date.month &&
-        l.logDate.day == date.day
-    ).toList()
-      ..sort((a, b) => a.entryTime.compareTo(b.entryTime));
-  }
-
+  // --- 1. INIT DB ---
   Future<void> initDB() async {
     _box = await Hive.openBox<AttendanceLog>('attendance_logs');
     notifyListeners();
   }
 
-  // --- STATS (UPDATED: OVERLAPPING COUNTS) ---
+  // --- 2. GET LOGS FOR DATE ---
+  List<AttendanceLog> getLogsForDate(DateTime date) {
+    if (_box == null) return [];
+
+    final logs = _box!.values.where((l) =>
+    l.logDate.year == date.year &&
+        l.logDate.month == date.month &&
+        l.logDate.day == date.day
+    ).toList();
+
+    logs.sort((a, b) {
+      if (a.status == "Absent" && b.status != "Absent") return 1;
+      if (a.status != "Absent" && b.status == "Absent") return -1;
+      return a.entryTime.compareTo(b.entryTime);
+    });
+
+    return logs;
+  }
+
+  // --- 3. GET ACTIVE DATES ---
+  List<DateTime> getActiveDates() {
+    if (_box == null) return [];
+    final uniqueDates = _box!.values.map((e) =>
+        DateTime(e.logDate.year, e.logDate.month, e.logDate.day)
+    ).toSet().toList();
+    uniqueDates.sort((a, b) => b.compareTo(a));
+    return uniqueDates;
+  }
+
+  // --- 4. STATS ---
   Map<String, double> getStatusDistribution(List<AttendanceLog> logs) {
-    int late = 0, absent = 0, replaced = 0, onTime = 0;
-
-    for (var e in logs) {
-      String s = e.status.toLowerCase();
-
-      // Absent is exclusive
-      if (s.contains("absent")) {
+    int onTime = 0, late = 0, absent = 0, replaced = 0;
+    for (var log in logs) {
+      String statusLower = log.status.toLowerCase();
+      if (statusLower.contains("absent")) {
         absent++;
       } else {
-        // For present staff, check attributes independently
-
-        // 1. Check Replacement
-        if (s.contains("replaced")) {
-          replaced++;
-        }
-
-        // 2. Check Punctuality (Counts for both Normal AND Replaced staff)
-        if (s.contains("late")) {
-          late++;
-        } else {
-          // If not absent and not late, they are On Time
-          onTime++;
-        }
+        if (statusLower.contains("replaced")) replaced++;
+        if (statusLower.contains("late")) late++;
+        else onTime++;
       }
     }
-
     return {
       'On Time': onTime.toDouble(),
       'Late': late.toDouble(),
@@ -74,115 +67,123 @@ class DataProvider extends ChangeNotifier {
     };
   }
 
-  int getTotalRecords(List<AttendanceLog> logs) {
-    // Total Physical Scans (Present People)
-    // Only exclude Absent. Replaced staff are physically present, so they count.
-    return logs.where((e) => !e.status.toLowerCase().contains("absent")).length;
-  }
-
-  // --- PROCESS FILES (UPDATED STATUS STRING) ---
+  // --- 5. PROCESS FILES (FINAL FIX) ---
   Future<String> processFiles(List<File> files, DateTime selectedDate) async {
     _isLoading = true;
     notifyListeners();
 
-    int addedCount = 0;
+    int totalProcessed = 0;
     int errorCount = 0;
     Map<String, AttendanceLog> batchMap = {};
 
-    final replacementRegex = RegExp(r"(.*?)\(Rep\s+(.*?)\)");
-
     try {
       for (var file in files) {
-        List<String> lines = await file.readAsLines();
-        if (lines.isNotEmpty && lines[0].toLowerCase().contains("staff")) lines.removeAt(0);
+        final input = await file.readAsString();
 
-        // --- PASS 1: COLLECT ABSENT IDs ---
-        Map<String, String> nameToIdMap = {};
-        for (var line in lines) {
-          if (line.trim().isEmpty) continue;
-          List<String> cols = line.split(',').map((e) => e.trim()).toList();
-          if (cols.length < 6) continue;
+        // UNIVERSAL NEWLINE FIX:
+        // Some CSVs use \r, some \n. We let the converter detect it.
+        // If it fails (rows.length == 1), we force it.
+        var converter = const CsvToListConverter();
+        List<List<dynamic>> rows = converter.convert(input);
 
-          String id = cols[0];
-          String name = cols[1];
-          String hall = cols[3];
-          String status = cols[5];
+        // Fallback for weird Excel formats (Mac/Old Windows)
+        if (rows.length <= 1 && input.contains('\r')) {
+          rows = converter.convert(input, eol: '\r');
+        }
+        if (rows.length <= 1 && input.contains('\n')) {
+          rows = converter.convert(input, eol: '\n');
+        }
 
-          if (status.toUpperCase() == "ABSENT") {
-            nameToIdMap[name.toLowerCase()] = id;
-            _addRecordToBatch(batchMap, AttendanceLog(
-                staffId: id,
-                name: name,
-                hall: hall,
-                entryTime: DateTime(selectedDate.year, selectedDate.month, selectedDate.day, 23, 59),
-                status: "Absent",
-                logDate: selectedDate
-            ));
+        if (rows.isEmpty) continue;
+
+        // --- STEP A: FIND HEADER ROW ---
+        int headerIndex = -1;
+        for (int i = 0; i < rows.length; i++) {
+          String rowStr = rows[i].join(',').toLowerCase();
+          // Fuzzy match to find the header row
+          if (rowStr.contains("staff") && rowStr.contains("id")) {
+            headerIndex = i;
+            break;
           }
         }
 
-        // --- PASS 2: PROCESS REST ---
-        for (var line in lines) {
-          if (line.trim().isEmpty) continue;
-          List<String> cols = line.split(',').map((e) => e.trim()).toList();
-          if (cols.length < 6) { errorCount++; continue; }
+        if (headerIndex == -1) {
+          print("Skipping ${file.path}: No valid header found.");
+          errorCount++;
+          continue;
+        }
 
-          String rawId = cols[0];
-          String rawName = cols[1];
-          String hall = cols[3];
-          String timeStr = cols[4];
-          String status = cols[5];
+        // --- STEP B: MAP COLUMNS ---
+        List<String> header = rows[headerIndex].map((e) => e.toString().trim().toLowerCase()).toList();
 
-          if (status.toUpperCase() == "ABSENT") continue;
+        // FUZZY MATCHING (Fixes the BOM/Hidden character issue)
+        int idIdx = header.indexWhere((h) => h.contains("staff") && h.contains("id"));
+        int nameIdx = header.indexWhere((h) => h.contains("staff") && h.contains("name"));
+        int statusIdx = header.indexWhere((h) => h.contains("status"));
+        int timeIdx = header.indexWhere((h) => h.contains("time"));
+        int hallIdx = header.indexWhere((h) => h.contains("hall"));
 
-          DateTime? entryTime = _parseFlexibleTime(selectedDate, timeStr);
-          if (entryTime == null) { errorCount++; continue; }
+        if (idIdx == -1 || nameIdx == -1 || statusIdx == -1) {
+          errorCount++;
+          continue;
+        }
 
-          final match = replacementRegex.firstMatch(rawName);
+        // --- STEP C: PROCESS DATA ---
+        for (int i = headerIndex + 1; i < rows.length; i++) {
+          var row = rows[i];
+          if (row.length <= statusIdx) continue; // Skip incomplete rows
 
-          if (match != null) {
-            String replacerName = match.group(1)?.trim() ?? "Unknown";
-            String replacedName = match.group(2)?.trim() ?? "Unknown";
-            String finalId = rawId;
-            String finalName = replacedName;
+          String id = row[idIdx].toString().trim();
+          String name = row[nameIdx].toString().trim();
+          String status = row[statusIdx].toString().trim();
+          String hall = (hallIdx != -1 && row.length > hallIdx) ? row[hallIdx].toString().trim() : "--";
+          String timeStr = (timeIdx != -1 && row.length > timeIdx) ? row[timeIdx].toString().trim() : "--";
 
-            if (nameToIdMap.containsKey(replacedName.toLowerCase())) {
-              finalId = nameToIdMap[replacedName.toLowerCase()]!;
-            }
+          if (id.isEmpty || name.isEmpty) continue;
 
-            // CRITICAL CHANGE: Append original status (Late/On Time) to the string
-            // New Format: "Replaced by Arjun - LATE ENTRY"
-            _addRecordToBatch(batchMap, AttendanceLog(
-                staffId: finalId,
-                name: finalName,
-                hall: hall,
-                entryTime: entryTime,
-                status: "Replaced by $replacerName - $status",
-                logDate: selectedDate
-            ));
-
+          // TIME PARSING
+          DateTime entryTime;
+          if (status.toUpperCase().contains("ABSENT") || timeStr == "--" || timeStr.isEmpty) {
+            entryTime = DateTime(selectedDate.year, selectedDate.month, selectedDate.day, 0, 0);
           } else {
-            _addRecordToBatch(batchMap, AttendanceLog(
-                staffId: rawId,
-                name: rawName,
-                hall: hall,
-                entryTime: entryTime,
-                status: status,
-                logDate: selectedDate
-            ));
+            entryTime = _parseFlexibleTime(selectedDate, timeStr) ??
+                DateTime(selectedDate.year, selectedDate.month, selectedDate.day, 0, 0);
+          }
+
+          if (name.contains("(Rep")) {
+            status = "Replaced - $status";
+          }
+
+          final log = AttendanceLog(
+            staffId: id,
+            name: name,
+            hall: hall, // Ensure your AttendanceLog model has 'hall'
+            entryTime: entryTime,
+            status: status,
+            logDate: DateTime(selectedDate.year, selectedDate.month, selectedDate.day),
+          );
+
+          // deduplication logic: prefer Present over Absent
+          if (batchMap.containsKey(id)) {
+            if (batchMap[id]!.status.contains("Absent") && !status.contains("Absent")) {
+              batchMap[id] = log;
+            }
+          } else {
+            batchMap[id] = log;
           }
         }
       }
 
-      for (var record in batchMap.values) {
-        String dbKey = "${DateFormat('yyyyMMdd').format(selectedDate)}_${record.staffId}";
-        await _box!.put(dbKey, record);
-        addedCount++;
+      // --- SAVE TO DATABASE ---
+      for (var log in batchMap.values) {
+        final key = "${DateFormat('yyyyMMdd').format(selectedDate)}_${log.staffId}";
+        await _box!.put(key, log);
+        totalProcessed++;
       }
 
       _isLoading = false;
       notifyListeners();
-      return "Processed: $addedCount records updated. (Errors: $errorCount)";
+      return "Success! Processed $totalProcessed records. (Errors/Skips: $errorCount)";
 
     } catch (e) {
       _isLoading = false;
@@ -191,24 +192,28 @@ class DataProvider extends ChangeNotifier {
     }
   }
 
-  void _addRecordToBatch(Map<String, AttendanceLog> map, AttendanceLog newRecord) {
-    if (!map.containsKey(newRecord.staffId)) {
-      map[newRecord.staffId] = newRecord;
-      return;
-    }
-    AttendanceLog existingRecord = map[newRecord.staffId]!;
-    bool isNewAbsent = newRecord.status.toLowerCase().contains("absent");
-    bool isExistingAbsent = existingRecord.status.toLowerCase().contains("absent");
+  // --- TIME PARSER HELPER ---
+  DateTime? _parseFlexibleTime(DateTime date, String timeStr) {
+    try {
+      // Clean up string "11/2 7:44:10 AM" -> "7:44:10 AM"
+      String cleanTime = timeStr.trim();
+      if (cleanTime.contains(' ')) {
+        List<String> parts = cleanTime.split(' ');
+        if (parts.length > 2) {
+          // If format is "Date Time AM/PM" -> take the last 2 parts "7:44:10 AM"
+          cleanTime = "${parts[parts.length-2]} ${parts[parts.length-1]}";
+        }
+      }
 
-    if (isExistingAbsent && !isNewAbsent) {
-      map[newRecord.staffId] = newRecord;
-      return;
-    }
-    if (!isExistingAbsent && isNewAbsent) {
-      return;
-    }
-    if (existingRecord.entryTime.isAfter(newRecord.entryTime)) {
-      map[newRecord.staffId] = newRecord;
+      try {
+        DateTime t = DateFormat("h:mm:ss a").parse(cleanTime);
+        return DateTime(date.year, date.month, date.day, t.hour, t.minute, t.second);
+      } catch (_) {
+        DateTime t = DateFormat("h:mm a").parse(cleanTime);
+        return DateTime(date.year, date.month, date.day, t.hour, t.minute, 0);
+      }
+    } catch (e) {
+      return null;
     }
   }
 
@@ -219,31 +224,8 @@ class DataProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  List<DateTime> getActiveDates() {
-    if (_box == null) return [];
-    final dates = _box!.values.map((e) => e.logDate).toSet().toList();
-    dates.sort((a, b) => b.compareTo(a));
-    return dates;
-  }
-
   Future<void> clearAllData() async {
     await _box?.clear();
     notifyListeners();
-  }
-
-  DateTime? _parseFlexibleTime(DateTime date, String timeStr) {
-    if (timeStr == "--" || timeStr.isEmpty) return null;
-    List<String> formats = [
-      "d/M h:mm:ss a", "d/M h:mm a", "M/d h:mm:ss a",
-      "h:mm a", "h:mm:ss a", "HH:mm", "H:mm"
-    ];
-    for (var fmt in formats) {
-      try {
-        DateFormat parser = DateFormat(fmt);
-        DateTime t = parser.parse(timeStr);
-        return DateTime(date.year, date.month, date.day, t.hour, t.minute, t.second);
-      } catch (e) {}
-    }
-    return null;
   }
 }
