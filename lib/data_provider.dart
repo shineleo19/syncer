@@ -28,8 +28,14 @@ class DataProvider extends ChangeNotifier {
     ).toList();
 
     logs.sort((a, b) {
-      if (a.status == "Absent" && b.status != "Absent") return 1;
-      if (a.status != "Absent" && b.status == "Absent") return -1;
+      // Sort Absents to the bottom
+      bool aAbsent = a.status.toUpperCase().contains("ABSENT");
+      bool bAbsent = b.status.toUpperCase().contains("ABSENT");
+
+      if (aAbsent && !bAbsent) return 1;
+      if (!aAbsent && bAbsent) return -1;
+
+      // Otherwise sort by entry time
       return a.entryTime.compareTo(b.entryTime);
     });
 
@@ -42,6 +48,7 @@ class DataProvider extends ChangeNotifier {
     final uniqueDates = _box!.values.map((e) =>
         DateTime(e.logDate.year, e.logDate.month, e.logDate.day)
     ).toSet().toList();
+
     uniqueDates.sort((a, b) => b.compareTo(a));
     return uniqueDates;
   }
@@ -49,16 +56,23 @@ class DataProvider extends ChangeNotifier {
   // --- 4. STATS ---
   Map<String, double> getStatusDistribution(List<AttendanceLog> logs) {
     int onTime = 0, late = 0, absent = 0, replaced = 0;
+
     for (var log in logs) {
       String statusLower = log.status.toLowerCase();
+
       if (statusLower.contains("absent")) {
         absent++;
       } else {
         if (statusLower.contains("replaced")) replaced++;
-        if (statusLower.contains("late")) late++;
-        else onTime++;
+
+        if (statusLower.contains("late")) {
+          late++;
+        } else {
+          onTime++;
+        }
       }
     }
+
     return {
       'On Time': onTime.toDouble(),
       'Late': late.toDouble(),
@@ -74,6 +88,8 @@ class DataProvider extends ChangeNotifier {
 
     int totalProcessed = 0;
     int errorCount = 0;
+
+    // Key: StaffID, Value: AttendanceLog
     Map<String, AttendanceLog> batchMap = {};
 
     try {
@@ -81,8 +97,6 @@ class DataProvider extends ChangeNotifier {
         final input = await file.readAsString();
 
         // UNIVERSAL NEWLINE FIX:
-        // Some CSVs use \r, some \n. We let the converter detect it.
-        // If it fails (rows.length == 1), we force it.
         var converter = const CsvToListConverter();
         List<List<dynamic>> rows = converter.convert(input);
 
@@ -116,12 +130,12 @@ class DataProvider extends ChangeNotifier {
         // --- STEP B: MAP COLUMNS ---
         List<String> header = rows[headerIndex].map((e) => e.toString().trim().toLowerCase()).toList();
 
-        // FUZZY MATCHING (Fixes the BOM/Hidden character issue)
+        // FUZZY MATCHING (Fixes BOM/Hidden character issue)
         int idIdx = header.indexWhere((h) => h.contains("staff") && h.contains("id"));
         int nameIdx = header.indexWhere((h) => h.contains("staff") && h.contains("name"));
-        int statusIdx = header.indexWhere((h) => h.contains("status"));
-        int timeIdx = header.indexWhere((h) => h.contains("time"));
-        int hallIdx = header.indexWhere((h) => h.contains("hall"));
+        int statusIdx = header.indexWhere((h) => h.contains("status")); // Entry Status
+        int timeIdx = header.indexWhere((h) => h.contains("time"));     // Time In
+        int hallIdx = header.indexWhere((h) => h.contains("hall"));     // Hall No
 
         if (idIdx == -1 || nameIdx == -1 || statusIdx == -1) {
           errorCount++;
@@ -143,7 +157,10 @@ class DataProvider extends ChangeNotifier {
 
           // TIME PARSING
           DateTime entryTime;
-          if (status.toUpperCase().contains("ABSENT") || timeStr == "--" || timeStr.isEmpty) {
+          // IMPORTANT: Case Insensitive Check for Absent
+          bool isAbsent = status.toUpperCase().contains("ABSENT");
+
+          if (isAbsent || timeStr == "--" || timeStr.isEmpty) {
             entryTime = DateTime(selectedDate.year, selectedDate.month, selectedDate.day, 0, 0);
           } else {
             entryTime = _parseFlexibleTime(selectedDate, timeStr) ??
@@ -157,18 +174,38 @@ class DataProvider extends ChangeNotifier {
           final log = AttendanceLog(
             staffId: id,
             name: name,
-            hall: hall, // Ensure your AttendanceLog model has 'hall'
+            hall: hall,
             entryTime: entryTime,
             status: status,
             logDate: DateTime(selectedDate.year, selectedDate.month, selectedDate.day),
           );
 
-          // deduplication logic: prefer Present over Absent
+          // --- DEDUPLICATION LOGIC (THE FIX) ---
           if (batchMap.containsKey(id)) {
-            if (batchMap[id]!.status.contains("Absent") && !status.contains("Absent")) {
+            final existingLog = batchMap[id]!;
+
+            // Check statuses (Case Insensitive)
+            bool oldIsAbsent = existingLog.status.toUpperCase().contains("ABSENT");
+            bool newIsAbsent = status.toUpperCase().contains("ABSENT");
+
+            // SCENARIO 1: Existing is ABSENT, New is PRESENT -> Overwrite with New!
+            // (Because we found they actually attended in another file)
+            if (oldIsAbsent && !newIsAbsent) {
               batchMap[id] = log;
             }
+            // SCENARIO 2: Both are PRESENT -> Keep the one with the EARLIEST time
+            // (Assuming earlier scan is the correct entry time)
+            else if (!oldIsAbsent && !newIsAbsent) {
+              // Only update if new time is valid and earlier than existing
+              if (log.entryTime.hour != 0 && log.entryTime.isBefore(existingLog.entryTime)) {
+                batchMap[id] = log;
+              }
+            }
+            // SCENARIO 3: Existing is PRESENT, New is ABSENT -> IGNORE New.
+            // (We already know they are present, so ignore the file that says they are absent)
+
           } else {
+            // New ID, just add it
             batchMap[id] = log;
           }
         }
